@@ -1,0 +1,201 @@
+---
+title: "07.10IdentifySubOptimum"
+author: "Trevor Cambron"
+date: "9/30/2021"
+output: html_document
+---
+
+The goal of this script is to identify where conservation tillage could have the greatest effect, but is being underutilized.
+```{r}
+library(cluster)
+library(tidyverse)
+library(grf)
+library(sf)
+library(raster)
+library(latticeExtra)
+library(RColorBrewer)
+library(here)
+#library(rgdal)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(magrittr)
+```
+Start with improting a dataset that includes latitude, longitude and tillage status
+```{r}
+rainfedscratchFolder <- '# Insert Results Folder'
+# datasets
+rainfedoverlap <- readRDS(paste0(rainfedscratchFolder, '/overlap.rds'))
+rainfedY_hat <- readRDS(paste0(rainfedscratchFolder, '/Y_hat.rds'))
+rainfedcf <- readRDS(paste0(rainfedscratchFolder, '/cf_xc1.rds'))
+rainfedvarImp <- readRDS(paste0(rainfedscratchFolder, '/cf_xc1_varImp.rds'))
+fips <- readOGR('# Spatial Data folder /UScounties.shp')
+states <- readOGR('# Spatial Data Folder /tl_2021_us_state.shp')
+rfdf <- readRDS(' # Data Folder /switchConstantMerge_switch20082020_connPxClimate4_2022-04-11.rds')
+
+NASS2017 <- readRDS(' # Data Folder /NASS2017County.RDS')
+```
+How many fields were constant high and low?
+```{r}
+df2020 <- subset(rfdf, year == 2020)
+
+ir2020 <- subset(df2020, irrigation == 1)
+
+rf2020 <- subset(df2020, irrigation == 0)
+
+rfLT <- nrow(rf2020[grepl('low', rf2020$tillStatus),])
+rfHT <- nrow(rf2020[grepl('high', rf2020$tillStatus),])
+
+
+
+CrfLT <- nrow(rf2020[grepl('constant_low', rf2020$tillStatus),])
+CrfHT <- nrow(rf2020[grepl('constant_high', rf2020$tillStatus),])
+
+CrfHT/ (CrfHT + CrfLT)
+
+```
+Next process these raw results so we have something more usable 
+```{r}
+# process results ------------------------------
+# add predicted treatment effects to data 
+rainfedconstOob_predict <- predict(rainfedcf)
+
+# add hats to original data frame
+rainfedoverlapW0 <- rainfedoverlap %>%
+  bind_cols(data.frame(Y_hat = rainfedY_hat))
+
+rainfedcolVars <- rainfedvarImp %>% dplyr::pull(variable)
+
+rainfedoverlapW <- rainfedoverlapW0 %>%
+  mutate_at(rainfedcolVars, list(Q4 = ~ntile(., 4),
+                          Q5 = ~ntile(., 5)))
+
+rainfedoverlapTau <- rainfedoverlapW %>%
+  bind_cols(rainfedconstOob_predict) 
+
+# is this right? can remove
+rainfedoverlapTau2020 <- subset(rainfedoverlapTau, rainfedoverlapTau$ year == 2020)
+
+rf_ate_cf_aipw = average_treatment_effect(rainfedcf, target.sample= 'all')
+tauhat_rf_aipw = c(ATE=rf_ate_cf_aipw["estimate"],
+                   lower_ci=rf_ate_cf_aipw["estimate"] - 1.96 * rf_ate_cf_aipw["std.err"],
+                   upper_ci=rf_ate_cf_aipw["estimate"] + 1.96 * rf_ate_cf_aipw["std.err"])
+tauhat_rf_aipw
+
+# as a percentage of yield
+rf_meanYield <- mean(rainfedoverlapTau$Y)
+rf_meanYield
+
+tauhat_rf_aipw_percent <- tauhat_rf_aipw/rf_meanYield * 100
+tauhat_rf_aipw_percent
+
+# sampled in analysis
+nrow(rainfedoverlapTau)
+```
+
+
+Find the proportion of fields that had a negative treatment effect
+```{r}
+neg_te <- nrow(subset(rainfedoverlapTau, predictions < 0))
+total <- nrow(rainfedoverlapTau)
+neg_te / total
+```
+
+The following are only for rainfed fields. 
+
+# 1. Panel A, Find current % lt low till
+```{r}
+
+#---
+rfpt <- NASS2017 %>%
+  dplyr::select(c('fips', 'Proportion Low Till')) 
+
+names(rfpt)[names(rfpt) == 'fips'] <- 'FIPS'
+names(rfpt)[names(rfpt) == 'Proportion Low Till'] <- 'pLT'
+
+fipstoPlota <- merge(fips, rfpt, by = 'FIPS') %>%
+  subset(STATE_NAME %in% c('Kansas', 'North Dakota', 'South Dakota', 'Nebraska')) 
+
+
+
+till.pal <-  colorRampPalette(c('#FD0101','#0800FF'))
+
+
+statelineplot <- list("sp.polygons", states[which(states$STUSPS %in% c('KS','NE','SD','ND')),], lwd = 3)
+spplot(fipstoPlota, "pLT",  col.regions = till.pal(16), main = "Low Till (% of fields)", sp.layout = statelineplot) 
+
+```
+# Panel B. County Yield Benefit
+```{r}
+rainfedoverlapTau2020$perfield_prediction <- rainfedoverlapTau2020$count*(.09)*rainfedoverlapTau2020$predictions
+
+rainfedoverlapTau2020$perfield_yield <- rainfedoverlapTau2020$count*(.09)*rainfedoverlapTau2020$Y
+
+rfOvCt <- subset(rainfedoverlapTau2020, tillStatus == 'constant_high')
+
+rainfedATEC <- aggregate(perfield_prediction ~ fips, rfOvCt, FUN = sum )
+rainfedY <- aggregate(perfield_yield ~ fips, rainfedoverlapTau2020, FUN = sum )
+
+names(rainfedATEC)[names(rainfedATEC) == 'perfield_prediction'] <- 'sum_perfield_prediction'
+
+names(rainfedY)[names(rainfedY) == 'perfield_yield'] <- 'sum_perfield_yield'
+
+RFATEC <- merge(rainfedATEC, rainfedY, by = 'fips')
+
+RFATEC$pct_yi_ltht_ltlt <- 100 * (RFATEC$sum_perfield_prediction / RFATEC$sum_perfield_yield)
+
+RfYI <- RFATEC %>% dplyr::select(c('fips', 'pct_yi_ltht_ltlt'))
+
+names(RfYI)[names(RfYI) == 'fips'] <- 'FIPS'
+
+fipstoPlotc <- merge(fips, RfYI, by = 'FIPS')  %>%
+  subset(STATE_NAME %in% c('Kansas', 'North Dakota', 'South Dakota', 'Nebraska'))
+
+
+colorbreaks <- 18
+# scale range maize
+palMin <- -6
+palMax <- 12 
+# blue and red color ramps pulled from color brewer (no white)
+redRamp2 <- colorRampPalette(c('#fddbc7','#f4a582','#d6604d','#b2182b','#67001f'))
+blueRamp2 <- colorRampPalette(rev(c('#d1e5f0','#92c5de','#4393c3','#2166ac','#08519c')))#'#053061')))
+biPal <- c(blueRamp2(colorbreaks*(1/3)),redRamp2(colorbreaks*(2.1/3)))
+
+spplot(fipstoPlotc, 'pct_yi_ltht_ltlt', col.regions =biPal, main = "Yield Impact of Switching (%)", colorkey = list(height = 1, labels = list(seq(-6,12))), sp.layout = statelineplot) 
+
+# How much would switching lt high till to lt low till cause?
+
+sum(RFATEC$sum_perfield_prediction)
+
+sum(RFATEC$sum_perfield_prediction) / sum(rainfedY$sum_perfield_yield)
+```
+# Part C. Identify high-priority counties
+```{r}
+HPc <- merge(rfpt, RfYI, by = 'FIPS')
+ # Average percent low till 
+
+propLT_WC <- (sum(NASS2017$`Conservation Tillage`) + sum(NASS2017$`No Till`))/
+  (sum(NASS2017$`Conservation Tillage`) + sum(NASS2017$`No Till`) + sum(NASS2017$`Conventional Tillage`))
+
+hhPC <- subset(HPc, `pLT` < propLT_WC)
+HighPriorityCounties <- subset(hhPC, pct_yi_ltht_ltlt > 0)
+
+HPCPlot <- HighPriorityCounties %>% dplyr::select(c('FIPS')) 
+HPCPlot$TRU <- 1
+
+fipstoPlotd <- merge(fips, HPCPlot, by = 'FIPS') %>%
+  subset(STATE_NAME %in% c('Kansas', 'North Dakota', 'South Dakota', 'Nebraska'))
+
+statelineplot <- list("sp.polygons", states[which(states$STUSPS %in% c('KS','NE','SD','ND')),], lwd = 3)
+spplot(fipstoPlotd,'TRU',  sp.layout = statelineplot, col.regions = 'purple',  main = "High Priority Counties") 
+
+```
+
+Make 
+```{r}
+a <- plot(fipstoPlota['Proportion Low Till'],  pal = till.pal, main = "Low Till (% of fields)") + legend("bottomright", legend = levels(till.pal))
+b <- plot(fipstoPlotc['pct_yi_ltht_ltlt'],   main = "Yield Impact of Switching (%)", pal = biPal) 
+c <- plot(fipstoPlotd,'TRU',  main = "High Priority Counties", col.regions = 'purple') 
+
+grid.arrange(a,b,c, ncol = 3)
+```

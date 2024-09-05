@@ -1,0 +1,552 @@
+---
+title: "Maize_ConstantTill_Irrigated_ATET"
+author: "Trevor Cambron, adapted from Deines et al. 2019"
+date: "8/23/2021"
+output: html_document
+---
+
+# Causal Forests: Irrigated Long Term Tillage, Western US Cornbelt
+## Goal: Estimate the Average Treatment Effect, Average Treatmet Effect on the Treated, and Average Treatmet Effect on the Control
+In this analysis, the treatment is low-intensity tillage. The procedure is virtually idenfical to that used in 02.10Rainfed_ATE_Maize.Rmd
+Load desired packages 
+```{r}
+library(tidyverse)
+library(grf)
+library(naniar)
+library(grf)
+library(RColorBrewer)
+library(earth)
+library(corrplot)
+library(car)
+library(aod)
+library(sf)
+library(magrittr)
+library(Rcpp)
+require(Rcpp)
+library(here)
+library(dplyr)
+library(randomForest)
+require(caTools)
+library(ggplot2)
+library(maps)
+```
+
+Set the data folder and filename
+```{r}
+dataFolder <- paste0('# Insert Folder')
+dataFileNameAll <- 'switchConstantMerge_switch20082020_connPxClimate4_2022-04-11.rds'
+# output scratch folder for model output rdata objects
+scratchFolder <- paste0('# Insert Folder')
+scratch2 <- paste0('# Insert Folder')
+dir.create(file.path(scratchFolder), showWarnings = FALSE)
+```
+
+Load data and clean. This involves removing removing legacy variables that are irrelevant/ incomplete and combining others
+```{r}
+# all cleaned data
+tillYears <- readRDS(paste0(dataFolder,dataFileNameAll)) 
+drop <- c('drcl','till', 'till_2', 'V1', 'pr_grow_lag', 'tc_def_jul_lag')
+tillYears <- tillYears[,!(names(tillYears) %in% drop)]
+tillYears <- subset(tillYears, irrigation == 1)
+drop <- c('irrigation')
+tillYears <- tillYears[,!(names(tillYears) %in% drop)]
+# combine some variables, remove reduncancies
+tillYears2 <- tillYears 
+tillYears2 <- subset(tillYears2, yield > -0.01)
+```
+
+Remove SCYM (yield) outliers. Rename some variables, filter some subgroups
+```{r}
+# clean outliers from SCYM
+summary(tillYears2$yield)
+
+cleanQ <- quantile(tillYears2$yield, probs = c(0.0001, 0.9999), na.rm=TRUE)
+cleanQ
+
+# remove outliers:
+tillYearsAll <- tillYears2 %>%
+  ungroup() %>%
+  mutate(uniqueID = row_number())
+tillYearsAll <-   subset(tillYearsAll, yield > cleanQ[1])
+tillYearsAll<- subset(tillYearsAll, yield < cleanQ[2])
+
+#uncleaned 
+sc <- tillYears$fips
+sc <- substr(sc, start = 1, stop = 2)
+table(sc)
+
+length(unique(tillYearsAll$pointID)) 
+tillYearsAllConstant <- tillYearsAll %>%  filter(tillStatus == 'constant_high') 
+tillYearsAllConstant <- tillYearsAllConstant[,!(names(tillYearsAllConstant) %in% c("year_switched"))]
+tillYearsAllConstant <- na.omit(tillYearsAllConstant)
+length(unique(tillYearsAllConstant$pointID)) 
+tillYearsAllConstantLow <- tillYearsAll %>%  filter(tillStatus == 'constant_low') 
+tillYearsAllConstantLow <- tillYearsAllConstantLow[,!(names(tillYearsAllConstantLow) %in% c("year_switched"))]
+tillYearsAllConstantLow <- na.omit(tillYearsAllConstantLow)
+length(unique(tillYearsAllConstantLow$pointID)) 
+
+table(tillYearsAll$tillStatus)
+
+# treatment converter key
+binary <- data.frame(tillStatus = c('constant_high','constant_low'),
+                     W = c(0,1))
+
+tillYearsAll2 <- tillYearsAll %>%
+  left_join(binary) %>%
+  rename(Y = yield)
+```
+
+Get ready to run regression forest- omit NA's and pull some covariates to build a propensity score model
+```{r}
+# extract balanced thing for training
+samples_per_group <- 500
+set.seed(5)
+drop2 <- c("year_switched")
+tillYearsAll2 <- tillYearsAll2[,!(names(tillYearsAll2) %in% drop2)]
+constantLess <- tillYearsAll2 %>%
+  na.omit() %>%
+  group_by(ted, tillStatus, year) %>%
+  sample_n(., size = min(samples_per_group, n()), replace = FALSE) %>%
+  ungroup() %>%
+  mutate(year = as.integer(year))
+
+table(constantLess$tillStatus)
+
+table(constantLess$year)
+
+table(constantLess[,c('tillStatus','year')])
+
+table(tillYearsAll2$tillStatus)
+
+# how many repeat points
+nrow(constantLess)
+
+sum(duplicated(constantLess$pointID))
+
+
+length(unique(constantLess$pointID))
+
+
+# covariates: climate normals and soil variables
+X_norm <- constantLess %>%
+  dplyr::select(c(contains('norm'), contains('lay1'), 'slope',
+                  'sand', 'silt', 'soc', 'clay', 'pH',  'bulkDensityt', 'rootznaws'))
+
+# treatment
+W <- constantLess %>% dplyr::pull(W)
+
+```
+
+Run the regression forest and check it out!
+```{r}
+# run
+W_forest <- grf::regression_forest(X_norm, W, num.trees = 2000)
+
+W_hat <- predict(W_forest)$predictions
+
+WvarImp <- W_forest %>% 
+  variable_importance() %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(W_forest$X.orig)) %>% 
+  arrange(desc(V1))
+```
+
+Save some data that will be extracted later (aka right now)
+```{r}
+# save intermediates
+saveRDS(constantLess, paste0(scratchFolder, '/constantLess.rds'))
+saveRDS(W_forest, paste0(scratchFolder, '/W_forest.rds'))
+saveRDS(W_hat, paste0(scratchFolder, '/W_hat.rds'))
+saveRDS(WvarImp, paste0(scratchFolder, '/W_forest_varImp.rds'))
+
+# re-load so chunk runs in markdown output
+constantLess <- readRDS(paste0(scratchFolder, '/constantLess.rds'))
+W_hat <- readRDS(paste0(scratchFolder, '/W_hat.rds'))
+W <- constantLess %>% dplyr::pull(W)
+p_rf = W_hat
+```
+
+
+```{r}
+# filter it
+overlap0 <- constantLess %>%
+  mutate(w_hat = W_hat) %>%
+  mutate(keep = case_when(w_hat < 0.05 | w_hat > 0.95 ~ 0,
+                        w_hat >= 0.05 | w_hat <= 0.95  ~ 1))
+overlap <- overlap0 %>% filter(keep == 1)
+nrow(overlap0) - nrow(overlap)
+ 
+nrow(overlap)
+
+nrow(overlap)
+
+table(overlap$tillStatus)
+
+table(overlap$year)
+
+table(overlap[,c('tillStatus','year')])
+
+# compare remaining teds
+unique(constantLess$ted)
+
+unique(overlap$ted)
+
+both <- data.frame(W_hat = W_hat,
+                   type = paste0('"even" sampling (',nrow(constantLess), ' obs)')) %>%
+  bind_rows(data.frame(W_hat = overlap$w_hat,
+                       type = paste0('Propensity Filtered (', nrow(overlap), ' obs)')))
+
+ggplot(both,
+       aes(x = W_hat)) +
+  geom_histogram() +
+  geom_vline(xintercept = 0.05, col='red') +
+  geom_vline(xintercept = 0.95, col = 'red') +
+  facet_wrap(~type, nrow = 2) +
+  theme_bw()
+
+{plot(smooth.spline(p_rf, W, df = 4))
+  abline(0, 1)}
+
+{plot(smooth.spline(overlap$w_hat, overlap$W, df = 4))
+  abline(0, 1)}
+
+# save overlap data!
+saveRDS(overlap, paste0(scratchFolder, '/overlap.rds'))
+
+overlap <- readRDS(paste0(scratchFolder, '/overlap.rds'))
+```
+
+Pick variables for MARS^TM (Earth) modelling.
+Note that several variables such as lat, long, tmin, etc. seem to be arbitrarily removed, but these have actually been found to highly correlated to variables that either have a greater effect on yield or are much more interesting, so its not helpful to include them.
+Other variables are quirks in the data or not super helpful for the analysis (i.e. climate norms)
+```{r}
+# pick subset of variables by dropping stuff: candidate 1
+X_c1 <- overlap %>%
+  dplyr::select(-c(pointID, latitude, longitude, tmin_jul, ppt_apr, fips, meanTemp_may, constTillStatus, count, nObs, W,tillStatus, uniqueID,silt,clay, nccpi3corn,
+            contains('norm'), contains('ted')))
+X_c1 <- X_c1[,!(names(X_c1) %in% c('mukey', 'w_hat'))]
+
+# mars for var selection
+set.seed(5)
+marsAll <- earth::earth(Y ~ ., data = X_c1, degree = 2)
+summary(marsAll)
+ev <- evimp(marsAll) # estimate variable importance
+#plot(ev)
+ev
+
+saveRDS(marsAll, paste0(scratchFolder, '/mars_c1.rds'))
+
+
+# variables from mars
+marsAll <- readRDS(paste0(scratchFolder, '/mars_c1.rds'))
+summary(marsAll)
+ev <- evimp(marsAll) # estimate variable importance
+#plot(ev)
+ev
+
+envvars <- rownames(ev)
+
+# This approach just adds JJA solar radiation, keeping the other variables limited to those idenified by MARS
+varsToKeep = c(envvars,
+                    'tc_def_jun','srad_jja', 
+                    'slope', 'ppt_apr',  'vpd_july', 
+                    'tc_soilm_apr', 'tc_def_jun','sand','soc', 'rootznaws')
+```
+
+Run a regression forest 
+```{r}
+X <- overlap %>%
+  dplyr::select(all_of(varsToKeep))
+
+corr <- cor(X)
+corrplot(corr, type = 'upper')
+
+# outcome
+Y <- overlap %>% dplyr::pull(Y)
+
+Y_forest <- grf::regression_forest(X, Y, num.trees = 2000)
+```
+
+Check the variable importance in predicting yield
+```{r}
+YvarImp <- Y_forest %>% 
+  variable_importance() %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(Y_forest$X.orig)) %>% 
+  arrange(desc(V1))
+YvarImp
+```
+
+```{r}
+Y_hat <- predict(Y_forest)$predictions
+
+Ychecker <- data.frame(Y = Y,
+                       Y_hat = Y_hat,
+                       year = overlap$year)
+Yagreement <- lm(Y~Y_hat)
+summary(Yagreement)
+
+ggplot(Ychecker, aes(x=Y, y = Y_hat)) +
+  geom_hex() +
+  scale_fill_gradientn(colors = brewer.pal(9,'YlGnBu')) +
+  geom_smooth(method= 'lm') +
+  coord_equal(xlim=c(0,18), ylim=c(0,18)) + 
+  geom_abline(slope = 1, intercept = 0, linetype='dashed') + 
+  facet_wrap(~year) +
+  theme_bw()
+
+saveRDS(Y_hat, paste0(scratchFolder, '/Y_hat.rds'))
+saveRDS(Y_forest, paste0(scratchFolder, '/Y_forest.rds'))
+saveRDS(YvarImp, paste0(scratchFolder, '/Y_forest_varImp.rds'))
+```
+
+Get ready to run causal forest, reload variables 
+```{r}
+# Causal Forest
+# reload overlap
+overlap <- readRDS(paste0(scratchFolder, '/overlap.rds'))
+Y_hat <- readRDS(paste0(scratchFolder, '/Y_hat.rds'))
+
+# reload mars variables
+marsAll <- readRDS(paste0(scratchFolder, '/mars_c1.rds'))
+ev <- evimp(marsAll) # estimate variable importance
+envvars <- rownames(ev)
+
+# treatment
+W <- overlap %>% dplyr::pull(W)
+w_hat <- overlap$w_hat
+
+# outcome
+Y <- overlap %>% dplyr::pull(Y)
+
+X_norm <- overlap %>%
+  dplyr::select(c(contains('norm'), contains('lay1'),'rootznaws', 'slope'))
+
+# make covariate list; 
+# add in important propensity variables, and things i like (GDD), sherries impt var (tcsoilmapr)
+varsToKeep_main = c(envvars,
+                    'tc_def_jun','srad_jja', 
+                    'slope',  'vpd_july', 
+                    'tc_soilm_apr', 'tc_def_jun','clay','soc', 'rootznaws')
+
+Xmain <- overlap %>%
+  dplyr::select(all_of(varsToKeep_main))
+
+corr <- cor(Xmain )
+corrplot(corr, type = 'upper')
+```
+
+Run the causal forests with 2000 trees for robust results 
+```{r}
+cf <- grf::causal_forest(Xmain, Y, W, Y_hat, w_hat, num.trees = 2000)
+```
+
+Save variable importance 
+```{r}
+varImpMain <- cf %>% 
+  variable_importance() %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(cf$X.orig)) %>% 
+  arrange(desc(V1))
+
+
+saveRDS(cf, paste0(scratchFolder, '/cf_xc1.rds'))
+saveRDS(varImpMain, paste0(scratchFolder, '/cf_xc1_varImp.rds'))
+overlap <- readRDS(paste0(scratchFolder, '/overlap.rds'))
+```
+
+Look at some Causal forest results 
+```{r}
+# marsAll <- readRDS(paste0(scratchFolder, '/mars_c1.rds'))
+
+
+#W_forest <- readRDS(paste0(scratchFolder, '/W_forest.rds'))
+#W_hat <- readRDS(paste0(scratchFolder, '/W_hat.rds'))
+W_hat <- overlap %>% dplyr::pull(w_hat)
+#WvarImp <- readRDS(paste0(scratchFolder, '/W_forest_varImp.rds'))
+
+#Y_forest <- readRDS(paste0(scratchFolder, '/Y_forest.rds'))
+#Y_hat <- readRDS(paste0(scratchFolder, '/Y_hat.rds'))
+#YvarImp <- readRDS(paste0(scratchFolder, '/Y_forest_varImp.rds'))
+
+#cf <- readRDS(paste0(scratchFolder, '/cf_xc1.rds'))
+#varImp <- readRDS(paste0(scratchFolder, '/cf_xc1_varImp.rds'))
+varImp <- varImpMain
+# covariates: climate normals and soil variables
+X_norm <- overlap %>%
+  dplyr::select(-c(contains('norm'), contains('lay1'), 'slope'))
+
+# treatment
+W <- overlap %>% dplyr::pull(W)
+Y <- overlap %>% dplyr::pull(Y)
+
+#constantLess <- readRDS(paste0(scratchFolder, '/constantLess.rds'))
+#allWhat <- readRDS(paste0(scratchFolder, '/W_hat.rds'))
+allWhat <- W_hat
+
+# process results ------------------------------
+# add predicted treatment effects to data 
+constOob_predict <- predict(cf)
+
+# add hats to original data frame
+overlapW0 <- overlap %>%
+  bind_cols(data.frame(Y_hat = Y_hat))
+
+colNormals <- names(X_norm)
+colVars <- varImp %>% dplyr::pull(variable)
+
+overlapW <- overlapW0 %>%
+  mutate_at(colNormals, list(Q4n = ~ntile(., 4),
+                             Q5n = ~ntile(., 5))) %>%
+  mutate_at(colVars, list(Q4 = ~ntile(., 4),
+                          Q5 = ~ntile(., 5)))
+
+overlapTau <- overlapW %>%
+  bind_cols(constOob_predict) 
+```
+
+Find the average treatment effect of the control, representing the effect of giving treatment (low till) to subjects not likely to recieve it
+```{r}
+atec_cf_aipw = average_treatment_effect(cf, target.sample = "control")
+tauhat_rf_aipw = c(ATE=atec_cf_aipw["estimate"],
+                   lower_ci=atec_cf_aipw["estimate"] - 1.96 * atec_cf_aipw["std.err"],
+                   upper_ci=atec_cf_aipw["estimate"] + 1.96 * atec_cf_aipw["std.err"])
+print("Tons/ hectatre")
+tauhat_rf_aipw
+meanYield <- mean(overlapTau$Y)
+meanYield
+tauhat_rf_aipw_percent <- tauhat_rf_aipw/meanYield * 100
+print("TPercent of Yield")
+tauhat_rf_aipw_percent
+```
+
+Find average treatment effect of the treated, representing the effect of witholding treatment from sujects likely to recieve treatment
+Perhaps a less interesting question than the ATEC, but you can be the judge of that
+```{r}
+print("AVERAGE TREATMENT EFFECT OF THE TREATED")
+atet_cf_aipw = average_treatment_effect(cf, target.sample = "treated")
+tauhat_rf_aipw_t = c(ATE=atet_cf_aipw["estimate"],
+                   lower_ci=atet_cf_aipw["estimate"] - 1.96 * atet_cf_aipw["std.err"],
+                   upper_ci=atet_cf_aipw["estimtate"] + 1.96 * atet_cf_aipw["std.err"])
+print("Tons/ hectatre")
+tauhat_rf_aipw_t
+meanYield <- mean(overlapTau$Y)
+print("Percent of Yield")
+meanYield
+tauhat_rf_aipw_percent_t <- tauhat_rf_aipw_t/meanYield * 100
+tauhat_rf_aipw_percent_t
+```
+
+Now find average treatment effect (ATE). This is run on all of the propensity score filtered data 
+```{r}
+ate_cf_aipw = average_treatment_effect(cf)
+ate_cf_aipw = average_treatment_effect(cf, target.sample = 'all')
+tauhat_rf_aipw = c(ATE=ate_cf_aipw["estimate"],
+                   lower_ci=ate_cf_aipw["estimate"] - 1.96 * ate_cf_aipw["std.err"],
+                   upper_ci=ate_cf_aipw["estimate"] + 1.96 * ate_cf_aipw["std.err"])
+tauhat_rf_aipw
+```
+Now find average treatment effect on the overlap (ATO). This is run on all of the propensity score filtered data 
+```{r}
+ate_cf_aipw = average_treatment_effect(cf)
+ate_cf_aipw = average_treatment_effect(cf, target.sample = 'overlap')
+tauhat_rf_aipw = c(ATE=ate_cf_aipw["estimate"],
+                   lower_ci=ate_cf_aipw["estimate"] - 1.96 * ate_cf_aipw["std.err"],
+                   upper_ci=ate_cf_aipw["estimate"] + 1.96 * ate_cf_aipw["std.err"])
+tauhat_rf_aipw
+```
+```{r}
+
+# check propensity scores
+p_rf = W_hat
+hist(p_rf)
+
+{plot(smooth.spline(p_rf, W, df = 4))
+  abline(0, 1)}
+
+both <- data.frame(slope = constantLess$slope,
+                   type = '"Even" Sampled',
+                   class = as.character(constantLess$W),
+                   stringsAsFactors = FALSE) %>%
+  bind_rows(data.frame(slope = overlap$slope,
+                       type = 'Propensity Filtered',
+                       class = as.character(overlap$W),
+                       stringsAsFactors = FALSE))
+
+ggplot(both,
+       aes(x = slope, fill = class, group = class)) +
+  geom_histogram() +
+  facet_wrap(~type) +
+  theme_bw()
+
+nrow(constantLess)
+
+nrow(overlap)
+
+YvarImp 
+
+Ychecker <- data.frame(Y = Y,
+                       Y_hat = Y_hat,
+                       year = overlap$year)
+Yagreement <- lm(Y~Y_hat)
+summary(Yagreement)
+
+# yield year by year
+YcheckerLong <- Ychecker %>%
+  tidyr::gather(., key = variable, value = value, Y:Y_hat)
+
+
+ggplot(YcheckerLong, aes(x=as.factor(year), y = value, group = interaction(year,variable), 
+                         fill = variable)) +
+  geom_boxplot() +
+  theme_bw() +
+  ylab('Yield (t/ha)') +
+  xlab('Year')
+
+varImp
+```
+
+Find average treatment effect in terms of percent of yield 
+```{r}
+ate_cf_aipw = average_treatment_effect(cf, target.sample = "all")
+tauhat_rf_aipw = c(ATE=ate_cf_aipw["estimate"],
+                   lower_ci=ate_cf_aipw["estimate"] - 1.96 * ate_cf_aipw["std.err"],
+                   upper_ci=ate_cf_aipw["estimate"] + 1.96 * ate_cf_aipw["std.err"])
+tauhat_rf_aipw
+
+meanYield <- mean(overlapTau$Y)
+meanYield
+tauhat_rf_aipw_percent <- tauhat_rf_aipw/meanYield * 100
+tauhat_rf_aipw_percent
+```
+
+Plot some data 
+```{r}
+ggplot(overlapTau,
+       aes(x = predictions)) +
+  geom_histogram() +
+  xlim(-1,2)+
+  xlab('CATE') +
+  geom_vline(xintercept = 0, col = 'black', linetype = 'dashed') +
+  geom_vline(xintercept = ate_cf_aipw["control"], col = 'red') +
+  theme_bw()
+
+ggplot(overlapTau,
+       aes(x = year, y = predictions, group = year)) +
+  geom_boxplot() +
+  #facet_wrap(~W) +
+  theme_bw() + ggtitle('oob predicted treatment effects')
+
+# run best linear predictor analysis
+calibration <- test_calibration(cf)
+calibration
+
+causalVars <- overlap %>% dplyr::select(varImp$variable)
+
+corr <- cor(causalVars)
+corrplot(corr, type = 'upper')
+```
+
+With these outputs, we can both test for treatment effect heterogeneity as well as create a map of the treatment effects 
+
+

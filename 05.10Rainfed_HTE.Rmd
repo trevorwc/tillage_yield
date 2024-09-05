@@ -1,0 +1,386 @@
+---
+title: "Rainfed Figures R"
+author: Trevor Cambron
+output: html_document
+---
+This script creates figures including the map of yield impacts, ATE/C/T boxplots, and the IQR boxplots
+
+First load necessary packages
+```{r}
+library(ggpubr)
+library(tidyverse)
+library(grf)
+library(sf)
+
+
+library(raster)
+library(latticeExtra)
+library(RColorBrewer)
+
+library(here)
+#library(rgdal)
+library(reshape)
+sessionInfo()
+```
+
+Set folder destinations, import data 
+```{r}
+# scratch folder for model rdata objects
+scratchFolder <- '# Insert outputs/ results folder from previous scripts'
+
+# gis directory
+gisFolder <- paste0(here::here(),'#Insert Spatial Data folder')
+
+# dataset
+overlap <- readRDS(paste0(scratchFolder, '/overlap.rds'))
+
+Y_hat <- readRDS(paste0(scratchFolder, '/Y_hat.rds'))
+cf <- readRDS(paste0(scratchFolder, '/cf_xc1.rds'))
+varImp <- readRDS(paste0(scratchFolder, '/cf_xc1_varImp.rds'))
+
+# process results ------------------------------
+# add predicted treatment effects to data 
+constOob_predict <- predict(cf)
+
+# add hats to original data frame
+overlapW0 <- overlap %>%
+  bind_cols(data.frame(Y_hat = Y_hat))
+
+colVars <- varImp %>% dplyr::pull(variable)
+
+overlapW <- overlapW0 %>%
+  mutate_at(colVars, list(Q4 = ~ntile(., 4),
+                          Q5 = ~ntile(., 5)))
+
+overlapTau <- overlapW %>%
+  bind_cols(constOob_predict) 
+
+ate_cf_aipw = average_treatment_effect(cf, target.sample= 'all')
+tauhat_rf_aipw = c(ATE=ate_cf_aipw["estimate"],
+                   lower_ci=ate_cf_aipw["estimate"] - 1.96 * ate_cf_aipw["std.err"],
+                   upper_ci=ate_cf_aipw["estimate"] + 1.96 * ate_cf_aipw["std.err"])
+tauhat_rf_aipw
+
+# as a percentage of yield
+meanYield <- mean(overlapTau$Y)
+meanYield
+
+tauhat_rf_aipw_percent <- tauhat_rf_aipw/meanYield * 100
+tauhat_rf_aipw_percent
+
+atec_cf_aipw = average_treatment_effect(cf, target.sample= 'control')
+tauhat_rf_atec = c(ATE=atec_cf_aipw["estimate"],
+                   lower_ci=atec_cf_aipw["estimate"] - 1.96 * atec_cf_aipw["std.err"],
+                   upper_ci=atec_cf_aipw["estimate"] + 1.96 * atec_cf_aipw["std.err"])
+tauhat_rf_atec
+
+# as a percentage of yield
+meanYield <- mean(overlapTau$Y)
+meanYield
+
+tauhat_rf_atec_percent <- tauhat_rf_atec/meanYield * 100
+tauhat_rf_atec_percent
+
+atet_cf_aipw = average_treatment_effect(cf, target.sample= 'treated')
+tauhat_rf_atet = c(ATE=atet_cf_aipw["estimate"],
+                   lower_ci=atet_cf_aipw["estimate"] - 1.96 * atet_cf_aipw["std.err"],
+                   upper_ci=atet_cf_aipw["estimate"] + 1.96 * atet_cf_aipw["std.err"])
+tauhat_rf_atet
+
+# as a percentage of yield
+meanYield <- mean(overlapTau$Y)
+meanYield
+
+tauhat_rf_atet_percent <- tauhat_rf_atet/meanYield * 100
+tauhat_rf_atet_percent
+
+# sampled in analysis
+nrow(overlapTau)
+
+###REVIEW
+panelBackground <- 'gray30'
+stateLines <- 'gray10'
+stateFill <- 'gray50'
+
+colorbreaks <- 25
+
+# scale range maize
+palMin <- -25
+palMax <- 25
+
+# blue and red color ramps pulled from color brewer (no white)
+redRamp2 <- colorRampPalette(c('#fddbc7','#f4a582','#d6604d','#b2182b','#67001f'))
+blueRamp2 <- colorRampPalette(rev(c('#d1e5f0','#92c5de','#4393c3','#2166ac','#08519c')))#'#053061')))
+
+biPal <- c(blueRamp2(colorbreaks/5*2),redRamp2(colorbreaks/5*3))
+```
+
+Plot the results
+```{r}
+# state outlines
+states <- read_sf('# sptial data folder /s_11au16.shp') %>%
+  st_transform(5070) 
+statesStudy <- states %>%  filter(STATE %in%             c('SD','ND','NE','KS','MN','IA','MO','IL','WI','IN','MI','OH', 'KY', 'CO','WY', 'MT','OK','TX','NM', 'AR'))
+
+states_spdf <- as(statesStudy, 'Spatial')
+statesPlot <- as(states, 'Spatial')
+
+# raster map
+aeaProj <- '+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=1,1,-1,0,0,0,0 +units=m +datum=NAD83 +no_defs'
+states_spdf <- spTransform(states_spdf, CRS(aeaProj))
+corners <- bbox(states_spdf)
+grid <- raster(crs = aeaProj, res = 5000,
+                     extent(corners[1,1],     #xmin
+                            corners[1,2],      #xmax
+                            corners[2,1],       #ymin
+                            corners[2,2]))      #ymax
+grid[] <- 1:ncell(grid)
+gridmask <- mask(grid, states_spdf)
+#plot(gridmask)
+#plot(states_spdf, add = TRUE)
+# polygonize
+gridPoly <- rasterToPolygons(gridmask)
+# convert to sf
+grid_sf <- st_as_sf(gridPoly) %>% st_transform(4326) #%>% rename(cellID = layer)
+cates <- overlapTau %>%
+  mutate(tauPercents = predictions/meanYield*100)
+tau_sf <- st_as_sf(cates, coords = c('longitude','latitude'), crs = 4326)
+colorbreaks <- 25
+# scale range maize
+palMin <- -25
+palMax <- 25
+# blue and red color ramps pulled from color brewer (no white)
+redRamp2 <- colorRampPalette(c('#fddbc7','#f4a582','#d6604d','#b2182b','#67001f'))
+blueRamp2 <- colorRampPalette(rev(c('#d1e5f0','#92c5de','#4393c3','#2166ac','#08519c')))#'#053061')))
+biPal <- c(blueRamp2(colorbreaks/2),redRamp2(colorbreaks/2))
+```
+# map vis parameters
+for consistent mapping across figures
+you will need to adjust the mapXLim and mapYLim
+```{r mapVisParams}
+panelBackground <- 'lightgrey'
+stateLines <- 'black'
+stateFill <- 'gray'
+mapXLim <- c(-800000,180000)
+mapYLim <- c(1470000,2930000)
+```
+## Corn
+```{r}
+# add grid id to point taus
+tau_sf2 <- tau_sf %>%
+  dplyr::select(c(year, tauPercents, predictions)) %>%
+  st_join(grid_sf) 
+gridTaus0 <- tau_sf2 %>%
+  tidyr::drop_na() %>%
+  group_by(layer) %>%
+  summarize(meanTauP = mean(tauPercents),
+            meanTau = mean(predictions))
+gridTaus <- grid_sf %>%
+  left_join(gridTaus0) %>%
+  st_transform(5070)
+taus_spdf <- as(gridTaus, 'Spatial')
+tauRas <- rasterize(taus_spdf, gridmask, field = 'meanTauP', background = NA)
+# writeRaster(tauRas, '/Volumes/LaCie/2021_Semi_Arid_Tillage/05.10Results/02.11APRIL_Rainfed_ATE_MAIZE_Results/tauRas' )
+```
+```{r taurasR, dev = c('png','pdf'), dpi = 300, bg="transparent"}
+#tauRas <- raster("/Volumes/LaCie/2021_Semi_Arid_Tillage/05.10Results/02.10Rainfed_ATE_MAIZE_Results/maize_summaryEffects.tif")
+spplot(tauRas, col.regions = biPal, axes = TRUE,
+       at=seq(palMin, palMax, (-palMin + palMax)/colorbreaks),
+       colorkey = list(space = 'bottom'),
+       maxpixels = 1500000,
+       xlim = mapXLim, ylim = mapYLim,
+       par.settings = list(panel.background = list(col=panelBackground)), cex = 40) +
+  latticeExtra::layer(sp.polygons(statesPlot, lwd=.8, col=stateLines)) +
+  latticeExtra::layer(sp.polygons(statesPlot, lwd=.8, col=NA, fill = stateFill), under=T) 
+
+# combine data
+```
+```{r}
+cates <- overlapTau %>%
+  mutate(tauPercents = predictions/meanYield*100,
+         croptype = 'Maize') %>%
+  dplyr::select(c(croptype, predictions, tauPercents, year)) 
+
+# get ranges
+cates %>%
+  summarize(p5 = quantile(tauPercents, probs = c(0.05)),
+            p95 = quantile(tauPercents, probs = c(0.95)))
+
+ggplot(cates,
+       aes(x = tauPercents, fill = ..x..)) +
+  geom_histogram(breaks = seq(palMin, palMax, (-palMin + palMax)/colorbreaks),
+                 color = 'gray30') +
+  xlim(-25,25)+
+  scale_fill_gradientn(colors = biPal) +
+  scale_y_continuous(breaks = c(2000,4000,6000), labels = c(2, 4, 6)) +
+  xlab('Yield Impact (%)') +
+  ylab('Thousand Fields') +
+  #geom_vline(xintercept = 0, col = 'black', linetype = 'dashed') +
+  geom_vline(xintercept = tauhat_rf_aipw_percent[1], col = 'red', linetype = 'longdash') +
+  theme_bw() + theme(panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     panel.background = element_rect(fill = "black",
+                                                     colour = NA),
+                     plot.background = element_rect(fill = "black",
+                                                    colour = NA),
+                     panel.border = element_blank(),
+                     axis.text = element_text(color = 'white'),
+                     axis.line = element_line(color = 'white'),
+                     axis.title = element_text(color = 'white'),
+                     axis.ticks = element_line(color = 'white'),
+                     legend.position = 'none') +
+  theme(text = element_text(size = 35, face = 'bold'))
+
+```
+
+Now find ATEC 
+```{r}
+overlapTau.control <- subset(overlapTau, overlapTau$tillStatus == 'constant_high')
+cates.control <- overlapTau.control %>%
+  mutate(tauPercents = predictions/meanYield*100,
+         croptype = 'Maize') %>%
+  dplyr::select(c(croptype, predictions, tauPercents, year)) 
+
+# get ranges
+cates.control %>%
+  summarize(p5 = quantile(tauPercents, probs = c(0.05)),
+            p95 = quantile(tauPercents, probs = c(0.95)))
+```
+Now ATET 
+```{r}
+overlapTau.treated <- subset(overlapTau, overlapTau$tillStatus == 'constant_low')
+cates.treated <- overlapTau.treated %>%
+  mutate(tauPercents = predictions/meanYield*100,
+         croptype = 'Maize') %>%
+  dplyr::select(c(croptype, predictions, tauPercents, year)) 
+
+# get ranges
+cates.treated %>%
+  summarize(p5 = quantile(tauPercents, probs = c(0.05)),
+            p95 = quantile(tauPercents, probs = c(0.95)))
+```
+
+And make boxplots 
+```{r}
+cates$group <- 'ATE'
+cates.control$group <- 'ATEC'
+cates.treated$group <- 'ATET'
+
+catesdf <- rbind(cates, cates.control, cates.treated)
+ggplot(catesdf, aes(x = group, y = tauPercents))+
+  geom_boxplot()
+
+df.CI <- data.frame(Parameter = c("ATE", "ATEC", "ATET"), Estimate = c(tauhat_rf_aipw_percent[1],tauhat_rf_atec_percent[1], tauhat_rf_atet_percent[1]), Lower = c(tauhat_rf_aipw_percent[2],tauhat_rf_atec_percent[2], tauhat_rf_atet_percent[2]), Upper = c(tauhat_rf_aipw_percent[3],tauhat_rf_atec_percent[3], tauhat_rf_atet_percent[3]))
+
+ggplot(df.CI, aes(x = Parameter, y = Estimate))+
+  geom_point() +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper))
+```
+
+Add more vars:
+```{r}
+# bin cates: corn
+ate <- tauhat_rf_aipw[1]
+overlapTau_1 <- overlapTau %>%
+  # code for positive or negative treatment effect
+  mutate(cate_bin = case_when(predictions < 0 ~ 1,
+                              predictions >= 0 & predictions <= ate ~ 2,
+                              predictions > ate ~ 3),
+         cate_ntile = ntile(predictions, 5))
+
+```
+
+# Then the IQR boxplots
+```{r}
+# variables to highlight
+vars <- varImp[1:10,]$variable
+
+hte_df <- overlapTau_1 %>%
+  dplyr::select(c(pointID, year, predictions, cate_bin, vars)) %>%
+  tidyr::gather(., key = variable, value = value, vars)
+
+hte_df$variable[hte_df$variable == "tmax_apr"] <- "Apr Max T" #
+hte_df$variable[hte_df$variable == "tmin_may"] <- "May Min T" #
+hte_df$variable[hte_df$variable == "srad_jja"] <- "JJA SRad" #
+hte_df$variable[hte_df$variable == "tmin_aug"] <- "Aug T Min" #
+hte_df$variable[hte_df$variable == "soc"] <- "SOC" #
+hte_df$variable[hte_df$variable == "ppt_may"] <- "May Ppt" #
+hte_df$variable[hte_df$variable == "sand"] <- "Sand" #
+hte_df$variable[hte_df$variable == "pr_early"] <- "Early Seas Ppt" #
+hte_df$variable[hte_df$variable == "rootznaws"] <- "Rt Zn AWS" #
+hte_df$variable[hte_df$variable == "tc_soilm_apr"] <- "Apr Soil M" #
+hte_df$variable[hte_df$variable == "slope"] <- "Slope" #
+hte_df$variable[hte_df$variable == "bulkDensityt"] <- "Bulk Density" #
+
+
+# calculate IQR by bins
+hte_iqr <- hte_df %>% 
+  mutate(cate_bin = as.factor(cate_bin)) %>%
+  dplyr::group_by(variable, cate_bin) %>%
+  dplyr::summarize(mean = mean(value, na.rm=TRUE),
+                   stdev = sd(value, na.rm=TRUE),
+                   iqr_25 = quantile(value, probs = 0.25, na.rm=TRUE),
+                   iqr_50 = quantile(value, probs = 0.5, na.rm=TRUE),
+                   iqr_75 = quantile(value, probs = 0.75, na.rm=TRUE)) 
+
+catePalette3 <- c("#86BDDA","#F6B394","#CF5246")
+```
+
+```{r hte_iqr, dev = c('png','pdf'), dpi = 300, bg="transparent"}
+hte_iqr_1_6 <- ggplot(hte_iqr,
+  aes(x = cate_bin, y = value, group = cate_bin, fill = cate_bin)) +
+  geom_crossbar(aes(y = iqr_50, ymin = iqr_25, ymax = iqr_75)) +
+  scale_fill_manual(values = catePalette3) +
+  #ylab('') + xlab('') + 
+  facet_wrap(~variable, scales = 'free_x',nrow = 2) +
+  coord_flip() +
+  theme_bw() +
+  theme(legend.position = 'none') +
+  scale_x_discrete(breaks=c("1","2","3"),
+        labels=c("Negative", "Small\nPositive", "Above\nAverage")) +
+  xlab("Treatment Effect Magnitude") +
+  ylab("Value") +
+  theme(text = element_text(size=15),
+        axis.text.x = element_text(angle=45, hjust=1))
+  
+```
+Add more vars:
+```{r}
+# bin cates: corn
+ate <- tauhat_rf_aipw[1]
+overlapTau_1 <- overlapTau %>%
+  # code for positive or negative treatment effect
+  mutate(cate_bin = case_when(predictions < 0 ~ 1,
+                              predictions >= 0 & predictions <= ate ~ 2,
+                              predictions > ate ~ 3),
+         cate_ntile = ntile(predictions, 5))
+
+```
+
+```{r}
+rf_ate <- ate_cf_aipw["estimate"]
+overlapTau <- overlapTau %>%
+  mutate(cate_bin = case_when(predictions < 0 ~ "Negative",
+                              predictions >= 0 & predictions <= rf_ate ~ "Small Positive",
+                              predictions > rf_ate ~ "Above Average"))
+
+rf.num1<- select_if(overlapTau, is.numeric)
+rf.num <- rf.num1[ , which(apply(rf.num1, 2, var) != 0)]
+rf.pca <- rf.num %>%
+  #dplyr::select(c(vars <- varImp[1:5,]$variable))%>%
+  prcomp(scale. = TRUE, center = TRUE)
+```
+
+Plot the results
+```{r}
+catePalette3 <- c("#CF5246","#86BDDA", "#F6B394")
+```
+                               
+
+Make correlation plot
+```{r}
+M <- cor(overlapTau_1 %>%
+          dplyr::select(c(VarImp[1:12,])))
+corrplot(M, type="upper", order="hclust",
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
